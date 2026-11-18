@@ -1,6 +1,7 @@
 import logging
 import math
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any
@@ -43,6 +44,10 @@ class SeeedB601FollowerConfigBase:
     # Maps motor names to (send_can_id, recv_can_id)
     motor_can_ids: dict[str, tuple[int, int]] = field(default_factory=dict)
 
+    safe_zero_on_disconnect: bool = True
+    zero_missing_wrist_yaw: bool = True
+    check_gripper_zero_on_connect: bool = True
+
     # Control parameters are defined by concrete subclasses so different motor families
     # can keep their own defaults.
     ## Default target velocity for joints running in POS_VEL mode, in degrees/s.
@@ -77,6 +82,10 @@ logger = logging.getLogger(__name__)
 FOLLOWER_GRIPPER_MOTOR = "gripper"
 LONG_TIMEOUT_SEC = 0.1
 MEDIUM_TIMEOUT_SEC = 0.01
+
+
+class MotorOverheatError(KeyboardInterrupt):
+    """Stop control on overheat while distinguishing it from an operator Ctrl+C."""
 
 class SeeedB601FollowerBase(Robot):
     """
@@ -178,9 +187,9 @@ class SeeedB601FollowerBase(Robot):
 
         self.configure()
 
-        # Skip during the calibrate flow (calibrate=False); the gripper
-        # may not be homed yet and the probe would block connect().
-        if calibrate:
+        # Keep calibration independent of the optional startup closing probe.
+        # Bimanual teleoperation starts following the leader's current targets.
+        if calibrate and self.config.check_gripper_zero_on_connect:
             self.detect_gripper_zero()
 
         self._build_gravity_pairing()
@@ -281,6 +290,14 @@ class SeeedB601FollowerBase(Robot):
         lo, hi = self.config.joint_limits[FOLLOWER_GRIPPER_MOTOR]
         closing_sign = -math.copysign(1.0, hi if abs(hi) > abs(lo) else lo)
 
+        logger.info(
+            "%s gripper zero-detect start: port=%s, tolerance=%.2f deg, closing_sign=%+.0f",
+            self, self.config.port, tolerance_deg, closing_sign,
+        )
+        started = time.perf_counter()
+        first = None
+        min_pos, max_pos = float("inf"), float("-inf")
+        samples, poll_errors = 0, 0
         prev, stable = None, 0
         for _ in range(200):
             if self.motor_type == "rs":
@@ -295,12 +312,18 @@ class SeeedB601FollowerBase(Robot):
             motor.request_feedback()
             try:
                 self.bus.poll_feedback_once()
-            except Exception:
-                pass
+            except Exception as error:
+                poll_errors += 1
+                if poll_errors == 1:
+                    logger.warning("%s gripper zero-detect feedback poll failed: %s", self, error)
             state = motor.get_state()
             if state is None:
                 continue
             cur = math.degrees(state.pos)
+            samples += 1
+            if first is None:
+                first = cur
+            min_pos, max_pos = min(min_pos, cur), max(max_pos, cur)
             stable = stable + 1 if prev is not None and abs(cur - prev) < 0.1 else 0
             prev = cur
             if stable >= 5:
@@ -310,13 +333,24 @@ class SeeedB601FollowerBase(Robot):
             motor.send_mit(0.0, 0.0, 0.0, 1.5, 0.0)
         else:
             motor.send_force_pos(0.0, math.radians(10.0), force_ratio)
+        # These are cached motor-state reads, not a count of fresh CAN replies.
+        logger.info(
+            "%s gripper zero-detect result: port=%s, elapsed=%.3f s, state_reads=%d, "
+            "first=%.2f deg, last=%.2f deg, span=%.2f deg, stable_count=%d, poll_errors=%d, stop=%s",
+            self, self.config.port, time.perf_counter() - started, samples,
+            first if first is not None else float("nan"),
+            prev if prev is not None else float("nan"),
+            max_pos - min_pos if samples else float("nan"),
+            stable, poll_errors, "stable_readings" if stable >= 5 else "iteration_limit",
+        )
         if prev is not None and abs(prev) <= tolerance_deg:
             logger.info("gripper zero-detect: zero-point check passed")
         else:
             offset = prev if prev is not None else float("nan")
             raise RuntimeError(
                 "gripper zero-detect: gripper not homed, offset "
-                f"{offset:.2f} deg, please confirm gripper is at home or recalibrate"
+                f"{offset:.2f} deg, please confirm gripper is at home or recalibrate "
+                f"(robot={self.id}, port={self.config.port})"
             )
 
     def _read_motor_temperatures(self) -> dict[str, float]:
@@ -370,7 +404,7 @@ class SeeedB601FollowerBase(Robot):
                     temp_c,
                     overheat_threshold_c,
                 )
-                raise KeyboardInterrupt("Overheat detected")
+                raise MotorOverheatError("Overheat detected")
         return temperatures
 
     def mit_output_torque_limit(
@@ -434,18 +468,41 @@ class SeeedB601FollowerBase(Robot):
         tau = compute_generalized_gravity(model=model, q=q)
         return {name: float(tau[qi]) for name, qi in pairing.items()}
 
-    def safe_zero(self, step_interval_s: float = 0.02, exit_on_complete: bool = True) -> None:
+    def check_parking_feedback(self) -> dict[str, float]:
+        """Read motor positions and fail if the controller reports a parking fault."""
+        if not self.is_connected or self._emergency_disable_requested or not self.motors:
+            raise RuntimeError(f"{self}: parking requires a connected arm without an emergency stop")
+
+        for motor in self.motors.values():
+            motor.request_feedback()
+        self.bus.poll_feedback_once()
+        positions = {}
+        for name, motor in self.motors.items():
+            state = motor.get_state()
+            if state is None or not math.isfinite(state.pos) or not math.isfinite(state.t_mos):
+                raise RuntimeError(f"{self}: invalid parking feedback from {name}")
+            if state.t_mos > self.config.temp_overheat_threshold_c:
+                raise RuntimeError(f"{self}: {name} overheated during parking ({state.t_mos:.1f} °C)")
+            positions[name] = math.degrees(state.pos)
+        return positions
+
+    def safe_zero(
+        self, step_interval_s: float = 0.02, exit_on_complete: bool = True, *, verify: bool = False
+    ) -> bool:
         """Move arm joints back to zero in a safer two-stage interpolation.
 
         Stage 1: CAN ID 1/4/5/6 -> 0
         Stage 2: CAN ID 2/3 -> 0
+
+        With verify enabled, propagate feedback errors and require the reported
+        arm joint positions to be within five degrees of zero before returning.
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self._in_safe_zero:
             logger.warning("safe_zero skipped: already running.")
-            return
+            return False
 
         if step_interval_s < 0.0:
             raise ValueError("step_interval_s must be >= 0")
@@ -464,7 +521,7 @@ class SeeedB601FollowerBase(Robot):
 
             if not controlled_joints:
                 logger.warning("safe_zero skipped: no arm joints mapped to CAN IDs 1-6.")
-                return
+                return False
 
             def _read_motor_deg(joint_name: str) -> float:
                 """Read a joint's current angle in real motor degrees (no direction scaling)."""
@@ -518,19 +575,21 @@ class SeeedB601FollowerBase(Robot):
                 frames = _frame_count(active_starts, targets)
                 emergency_disable_threshold_c = self.config.temp_emergency_disable_threshold_c
                 for frame in range(1, frames + 1):
-                    temperatures = self._read_motor_temperatures()
-                    for motor_name, temp_c in temperatures.items():
-                        if temp_c > emergency_disable_threshold_c:
-                            logger.error(
-                                "Auto-disable on overtemperature during safe_zero: %s t_mos=%.2fC > %.2fC.",
-                                motor_name,
-                                temp_c,
-                                emergency_disable_threshold_c,
-                            )
-                            self._emergency_disable_requested = True
-                            self.disable_torque()
-                            logger.error("safe_zero aborted: emergency overtemperature.")
-                            return True
+                    if verify:
+                        self.check_parking_feedback()
+                    else:
+                        for motor_name, temp_c in self._read_motor_temperatures().items():
+                            if temp_c > emergency_disable_threshold_c:
+                                logger.error(
+                                    "Auto-disable on overtemperature during safe_zero: %s t_mos=%.2fC > %.2fC.",
+                                    motor_name,
+                                    temp_c,
+                                    emergency_disable_threshold_c,
+                                )
+                                self._emergency_disable_requested = True
+                                self.disable_torque()
+                                logger.error("safe_zero aborted: emergency overtemperature.")
+                                return True
 
                     ratio = frame / frames
                     action: RobotAction = {}
@@ -549,23 +608,31 @@ class SeeedB601FollowerBase(Robot):
 
                 return False
 
-            stage_1_start = {joint: _read_motor_deg(joint) for joint in stage_1}
-            stage_2_start = {joint: _read_motor_deg(joint) for joint in stage_2}
+            if verify:
+                positions = self.check_parking_feedback()
+                stage_1_start = {joint: positions[joint] for joint in stage_1}
+                stage_2_start = {joint: positions[joint] for joint in stage_2}
+            else:
+                stage_1_start = {joint: _read_motor_deg(joint) for joint in stage_1}
+                stage_2_start = {joint: _read_motor_deg(joint) for joint in stage_2}
 
             logger.info("safe_zero stage1 start: joints=%s", stage_1)
             if _interp_to_zero(stage_1_start, stage_2_start):
-                return
+                return False
 
             # Stage 2: move CAN ID 2/3 back to zero, and bring the gripper back to
             # 170° if it is currently past 180° (avoids leaving it wide open).
             stage_2_active = dict(stage_2_start)
             stage_2_targets: dict[str, float] = {}
             if FOLLOWER_GRIPPER_MOTOR in self.motors:
-                try:
-                    gripper_motor_deg = _read_motor_deg(FOLLOWER_GRIPPER_MOTOR)
-                except RuntimeError as e:
-                    logger.warning("safe_zero: could not read gripper position: %s", e)
-                    gripper_motor_deg = None
+                if verify:
+                    gripper_motor_deg = self.check_parking_feedback()[FOLLOWER_GRIPPER_MOTOR]
+                else:
+                    try:
+                        gripper_motor_deg = _read_motor_deg(FOLLOWER_GRIPPER_MOTOR)
+                    except RuntimeError as e:
+                        logger.warning("safe_zero: could not read gripper position: %s", e)
+                        gripper_motor_deg = None
 
                 if gripper_motor_deg is not None and abs(gripper_motor_deg) > 180.0:
                     # Wide open: bring it back toward 170°, preserving sign.
@@ -584,13 +651,19 @@ class SeeedB601FollowerBase(Robot):
                 {joint: 0.0 for joint in stage_1},
                 stage_2_targets,
             ):
-                return
-            logger.info("safe_zero done.")
+                return False
             time.sleep(2.0)
+            if verify:
+                positions = self.check_parking_feedback()
+                off_target = {joint: positions[joint] for joint in controlled_joints if abs(positions[joint]) > 5}
+                if off_target:
+                    raise RuntimeError(f"{self}: parking did not reach zero (degrees): {off_target}")
+            logger.info("safe_zero done.")
             if exit_on_complete:
                 # Raise KeyboardInterrupt so upper-level control loops handle this
                 # the same way as Ctrl+C.
                 raise KeyboardInterrupt("safe_zero completed")
+            return True
         finally:
             self._in_safe_zero = False
 
@@ -608,7 +681,7 @@ class SeeedB601FollowerBase(Robot):
             motor.request_feedback()
         try:
             self.bus.poll_feedback_once()
-        except:
+        except Exception:
             logger.warning(f"can bus poll feedback failed.")
 
         for motor_name, motor in self.motors.items():
@@ -665,7 +738,7 @@ class SeeedB601FollowerBase(Robot):
             goal_pos[motor_name] = position
 
         # To tolerate 6-DOF leader arms that don't have a wrist_yaw joint, we can allow the follower to ignore missing wrist_yaw commands by treating them as 0.
-        if 'wrist_yaw' not in goal_pos:
+        if self.config.zero_missing_wrist_yaw and 'wrist_yaw' not in goal_pos:
             goal_pos['wrist_yaw'] = 0.0
 
         # Safety: Cap relative target
@@ -744,11 +817,13 @@ class SeeedB601FollowerBase(Robot):
 
     def disconnect(self):
         """Disconnect from robot."""
-        if not self.is_connected:
+        if self.bus is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if (
-            not self._in_safe_zero
+            self.config.safe_zero_on_disconnect
+            and self.is_connected
+            and not self._in_safe_zero
             and not self._emergency_disable_requested
             and not self._skip_safe_zero_on_disconnect
         ):
@@ -762,17 +837,19 @@ class SeeedB601FollowerBase(Robot):
                 "(_skip_safe_zero_on_disconnect=True)."
             )
 
-        for motor in self.motors.values():
-            if self.config.disable_torque_on_disconnect:
-                motor.disable()
-            motor.clear_error()
-            motor.close()
-        
-        self.bus.close()
-        self.bus = None
-
-        for cam in self.cameras.values():
-            cam.disconnect()
-
-        self._emergency_disable_requested = False
+        try:
+            with ExitStack() as cleanup:
+                for cam in self.cameras.values():
+                    if cam.is_connected:
+                        cleanup.callback(cam.disconnect)
+                cleanup.callback(self.bus.close)
+                for motor in reversed(tuple(self.motors.values())):
+                    cleanup.callback(motor.close)
+                    cleanup.callback(motor.clear_error)
+                    if self.config.disable_torque_on_disconnect:
+                        cleanup.callback(motor.disable)
+        finally:
+            self.bus = None
+            self.motors.clear()
+            self._emergency_disable_requested = False
         logger.info(f"{self} disconnected.")
